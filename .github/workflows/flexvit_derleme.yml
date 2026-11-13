@@ -1,0 +1,111 @@
+# FlexViT (SECDA-TFLite) - PYNQ-Z2 icin derleme
+# GitHub'da: Actions sekmesi -> "FlexViT derleme" -> "Run workflow"
+# Sonuc: calisma sayfasinin altinda "Artifacts" bolumunde
+#   flexvit-pynq-z2      -> karta atilacak dosyalar
+#   derleme-gunlugu      -> hata olursa gonderilecek kayit
+
+name: FlexViT derleme
+
+on:
+  workflow_dispatch:
+
+jobs:
+  derle:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      TF_PYTHON_VERSION: "3.9"
+      BAZEL_ROOT: /mnt/bazel
+    steps:
+      - name: 1 - Disk alani ac
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo mkdir -p $BAZEL_ROOT && sudo chown -R $USER $BAZEL_ROOT
+          df -h / /mnt
+
+      - name: 2 - Araclari kur
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y crossbuild-essential-armhf libz-dev jq rsync unzip
+          wget -q https://github.com/bazelbuild/bazel/releases/download/6.1.0/bazel-6.1.0-linux-x86_64 -O bazel6
+          chmod +x bazel6 && sudo mv bazel6 /usr/local/bin/bazel6
+          bazel6 --version
+
+      - name: 3 - Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: 4 - SECDA-TFLite ve FlexViT'i indir
+        run: |
+          pip install numpy
+          git clone https://github.com/gicLAB/SECDA-TFLite.git
+          cd SECDA-TFLite
+          git submodule update --init --depth 1
+          cd tensorflow
+          git fetch --depth 1 origin secda-tflite-v2
+          git checkout -B secda-tflite-v2 FETCH_HEAD
+          git log -1 --format="tensorflow commit: %H"
+          cd ..
+          git log -1 --format="SECDA-TFLite commit: %H"
+          git clone https://github.com/gicLAB/FlexViT.git FlexViT
+          git -C FlexViT log -1 --format="FlexViT commit: %H"
+
+      - name: 5 - Kurulum betikleri (setup.sh + FlexViT entegrasyonu)
+        run: |
+          cd SECDA-TFLite/scripts
+          bash ./setup.sh
+          cd ../FlexViT
+          chmod +x flexvit_integration.sh patch_vscode.sh
+          ./flexvit_integration.sh
+          ls -la ../tensorflow/tensorflow/lite/delegates/utils/secda_delegates/
+          ls ../tensorflow/tensorflow/lite/delegates/utils/secda_delegates/vit_delegate/v9/
+
+      - name: 6 - TensorFlow configure (otomatik cevaplar)
+        continue-on-error: true
+        run: |
+          cd SECDA-TFLite/tensorflow
+          export PYTHON_BIN_PATH=$(which python3)
+          export PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
+          export TF_NEED_ROCM=0 TF_NEED_CUDA=0 TF_NEED_CLANG=0 TF_SET_ANDROID_WORKSPACE=0
+          export CC_OPT_FLAGS="-Wno-sign-compare"
+          yes "" | ./configure || true
+          cat .tf_configure.bazelrc || true
+
+      - name: 7 - Derle (benchmark_model + inference_diff, FlexViT temsilcisi ile)
+        run: |
+          cd SECDA-TFLite/tensorflow
+          FLAGS="--copt=-DSECDA_LOGGING_DISABLED --cxxopt=-march=armv7-a --cxxopt=-mfpu=neon --cxxopt=-funsafe-math-optimizations --cxxopt=-ftree-vectorize --copt=-DACC_PROFILE --define tflite_with_xnnpack=false --copt=-DTFLITE_ENABLE_XNNPACK=OFF --copt=-DTFLITE_WITHOUT_XNNPACK --copt=-DACC_NEON --@secda_tools//:config=fpga"
+          T=//tensorflow/lite/delegates/utils/secda_delegates/vit_delegate/v9
+          set -o pipefail
+          bazel6 --output_user_root=$BAZEL_ROOT build --config=elinux_armhf -c opt --jobs=4 \
+            $T:benchmark_model_plus_vit_delegate \
+            $T:inference_diff_plus_vit_delegate \
+            $FLAGS 2>&1 | tee ../../derleme.log
+
+      - name: 8 - Karta atilacak dosyalari topla
+        run: |
+          mkdir -p cikti/bin cikti/models cikti/bitstreams
+          B=SECDA-TFLite/tensorflow/bazel-out/armhf-opt/bin/tensorflow/lite/delegates/utils/secda_delegates/vit_delegate/v9
+          cp $B/benchmark_model_plus_vit_delegate $B/inference_diff_plus_vit_delegate cikti/bin/
+          cp SECDA-TFLite/FlexViT/src/data/models/deit_tiny_patch16_224.tflite cikti/models/
+          cp SECDA-TFLite/FlexViT/src/data/models/vit_tiny_patch16_224.tflite cikti/models/
+          cp SECDA-TFLite/FlexViT/src/hardware_automation/generated/VIT_9_0/VIT_9_0.* cikti/bitstreams/
+          cp SECDA-TFLite/FlexViT/src/hardware_automation/generated/CPU/CPU_1_0.* cikti/bitstreams/
+          cp SECDA-TFLite/scripts/load_bitstream.py cikti/
+          file cikti/bin/* | tee cikti/dosya_bilgisi.txt
+          ls -laR cikti
+
+      - name: 9 - Sonucu yukle (karta atilacak dosyalar)
+        uses: actions/upload-artifact@v4
+        with:
+          name: flexvit-pynq-z2
+          path: cikti
+
+      - name: 10 - Gunlugu yukle (hata olsa da)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: derleme-gunlugu
+          path: derleme.log
+          if-no-files-found: ignore
