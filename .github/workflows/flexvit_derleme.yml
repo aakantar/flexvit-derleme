@@ -1,10 +1,10 @@
-# FlexViT (SECDA-TFLite) - PYNQ-Z2 icin derleme
+# FlexViT (SECDA-TFLite) - PYNQ-Z2 icin derleme, surum 2: DMA tampon adresi FLEXVIT_DMA_BASE ile secilebilir
 # GitHub'da: Actions sekmesi -> "FlexViT derleme" -> "Run workflow"
 # Sonuc: calisma sayfasinin altinda "Artifacts" bolumunde
 #   flexvit-pynq-z2      -> karta atilacak dosyalar
-#   derleme-gunlugu      -> hata olursa gonderilecek kayit
+#   derleme-gunlugu      -> hata olursa bana gonderilecek kayit
 
-name: FlexViT derleme
+name: FlexViT derleme (hizli tampon)
 
 on:
   workflow_dispatch:
@@ -61,6 +61,39 @@ jobs:
           ls -la ../tensorflow/tensorflow/lite/delegates/utils/secda_delegates/
           ls ../tensorflow/tensorflow/lite/delegates/utils/secda_delegates/vit_delegate/v9/
 
+      - name: 5b - DMA tampon adreslerini calisma aninda secilebilir yap
+        run: |
+          cat > yama_dma_adres.py <<'PYEOF'
+          # FlexViT DMA tampon adreslerini calisma aninda secilebilir yapar (FLEXVIT_DMA_BASE).
+          # Ortam degiskeni yoksa orijinal adresler aynen kullanilir.
+          import re, sys
+          p = sys.argv[1]
+          s = open(p).read()
+          if 'fv_dma_addr' in s:
+              print('zaten yamali:', p); sys.exit(0)
+          helper = '''#include <cstdlib>
+          static inline unsigned int fv_dma_addr(int i, int out) {
+            const char *s = getenv("FLEXVIT_DMA_BASE");
+            if (s) return (unsigned int)strtoul(s, 0, 0) + i * 0x800000u + (out ? 0x400000u : 0u);
+            return 0x16000000u + i * 0x2000000u + (out ? 0x800000u : 0u);
+          }
+          '''
+          n = 0
+          for i in range(4):
+              s, k = re.subn(r'(?m)^#define dma_in%d 0x[0-9a-fA-F]+' % i, '#define dma_in%d fv_dma_addr(%d, 0)' % (i, i), s); n += k
+              s, k = re.subn(r'(?m)^#define dma_out%d 0x[0-9a-fA-F]+' % i, '#define dma_out%d fv_dma_addr(%d, 1)' % (i, i), s); n += k
+          s, k = re.subn(r'#define DMA_IN_BUF_SIZE_4 \(dma_out1 - dma_in0\)', '#define DMA_IN_BUF_SIZE_4 0x2800000', s); n += k
+          assert n == 9, "beklenen 9 degisiklik, bulunan %d" % n
+          s = s.replace('#define ACC_CONFIG_H\n', '#define ACC_CONFIG_H\n' + helper, 1)
+          open(p, 'w').write(s)
+          print("yama uygulandi:", p)
+          PYEOF
+          FILES=$(find SECDA-TFLite -path "*vit_delegate/v9/accelerator/acc_config.sc.h" -type f)
+          echo "Bulunan dosyalar: $FILES"
+          test -n "$FILES"
+          for f in $FILES; do python3 yama_dma_adres.py "$f"; done
+          grep -n "fv_dma_addr\|DMA_IN_BUF_SIZE_4" $FILES
+
       - name: 6 - TensorFlow configure (otomatik cevaplar)
         continue-on-error: true
         run: |
@@ -99,7 +132,7 @@ jobs:
       - name: 9 - Sonucu yukle (karta atilacak dosyalar)
         uses: actions/upload-artifact@v4
         with:
-          name: flexvit-pynq-z2
+          name: flexvit-pynq-z2-v2
           path: cikti
 
       - name: 10 - Gunlugu yukle (hata olsa da)
