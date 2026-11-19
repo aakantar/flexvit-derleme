@@ -1,10 +1,10 @@
-# FlexViT (SECDA-TFLite) - PYNQ-Z2 icin derleme, surum 2: DMA tampon adresi FLEXVIT_DMA_BASE ile secilebilir
+# FlexViT (SECDA-TFLite) - PYNQ-Z2 icin derleme, surum 3: DMA adresi secilebilir + DMA baslatma/bitiste bellek bariyeri (dsb + L2 sync)
 # GitHub'da: Actions sekmesi -> "FlexViT derleme" -> "Run workflow"
 # Sonuc: calisma sayfasinin altinda "Artifacts" bolumunde
 #   flexvit-pynq-z2      -> karta atilacak dosyalar
 #   derleme-gunlugu      -> hata olursa bana gonderilecek kayit
 
-name: FlexViT derleme (hizli tampon)
+name: FlexViT derleme (bariyer)
 
 on:
   workflow_dispatch:
@@ -94,6 +94,73 @@ jobs:
           for f in $FILES; do python3 yama_dma_adres.py "$f"; done
           grep -n "fv_dma_addr\|DMA_IN_BUF_SIZE_4" $FILES
 
+      - name: 5c - secda_tools DMA API'sine bellek bariyeri ekle
+        run: |
+          git clone -q --depth 1 --branch 0.2.2 https://github.com/judeharis/secda_tools.git secda_tools_yamali
+          cat > yama_bariyer.py <<'PYEOF'
+          # FlexViT/SECDA DMA API'sine bellek bariyeri ekler (axi_api_v4.tpp).
+          # DMA baslatilmadan once: dsb + L2 (PL310) cache sync + dsb   -> islemcinin yazdiklari DDR'ye ulasmis olur
+          # DMA bittikten sonra: dsb                                      -> cikti okumalari DMA'dan sonra yapilir
+          # FLEXVIT_NO_L2SYNC=1 ortam degiskeni L2 sync'i kapatir (yalniz dsb kalir) -> karsilastirma icin.
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          if "fv_barrier" in s:
+              print("zaten yamali:", p); sys.exit(0)
+          helper = r'''
+          // ---- FlexViT tez yamasi: bellek bariyerleri ----
+          #include <fcntl.h>
+          #include <sys/mman.h>
+          #include <unistd.h>
+          #include <cstdlib>
+          static inline void fv_dsb() {
+          #if defined(__arm__)
+            __asm__ __volatile__("dsb sy" ::: "memory");
+          #else
+            __sync_synchronize();
+          #endif
+          }
+          static volatile unsigned int *fv_l2c = nullptr;
+          static int fv_l2c_init = 0;
+          static inline void fv_l2_sync() {
+          #if defined(__arm__)
+            if (!fv_l2c_init) {
+              fv_l2c_init = 1;
+              if (!getenv("FLEXVIT_NO_L2SYNC")) {
+                int fd = open("/dev/mem", O_RDWR | O_SYNC);
+                if (fd >= 0) {
+                  void *pp = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0xF8F02000);
+                  close(fd);
+                  if (pp != MAP_FAILED) fv_l2c = (volatile unsigned int *)pp;
+                }
+              }
+            }
+            if (fv_l2c) {
+              fv_l2c[0x730 / 4] = 0;
+              while (fv_l2c[0x730 / 4] & 1) {
+              }
+            }
+          #endif
+          }
+          static inline void fv_barrier() { fv_dsb(); fv_l2_sync(); fv_dsb(); }
+          // ---- yama sonu ----
+          '''
+          n = 0
+          old_w = "void *base_addr = (void *)dma_addr;\n  *((volatile unsigned int *)"
+          new_w = "void *base_addr = (void *)dma_addr;\n  if (offset == MM2S_LENGTH || offset == S2MM_LENGTH) fv_barrier();\n  *((volatile unsigned int *)"
+          assert s.count(old_w) == 1, "writeMappedReg bulunamadi"
+          s = s.replace(old_w, new_w); n += 1
+          for st in ("mm2s_status", "s2mm_status"):
+              old = "    %s = readMappedReg(%s_STATUS_REGISTER);\n  }\n" % (st, st[:4].upper())
+              assert s.count(old) == 1, "sync dongusu bulunamadi: " + st
+              s = s.replace(old, old + "  fv_dsb();\n"); n += 1
+          s = helper + s
+          open(p, "w").write(s)
+          print("yama uygulandi (%d degisiklik):" % n, p)
+          PYEOF
+          python3 yama_bariyer.py secda_tools_yamali/secda_tools/axi_support/v5/axi_api_v5.tpp
+          grep -n "fv_barrier();\|fv_dsb();" secda_tools_yamali/secda_tools/axi_support/v5/axi_api_v5.tpp
+
       - name: 6 - TensorFlow configure (otomatik cevaplar)
         continue-on-error: true
         run: |
@@ -108,7 +175,7 @@ jobs:
       - name: 7 - Derle (benchmark_model + inference_diff, FlexViT temsilcisi ile)
         run: |
           cd SECDA-TFLite/tensorflow
-          FLAGS="--copt=-DSECDA_LOGGING_DISABLED --cxxopt=-march=armv7-a --cxxopt=-mfpu=neon --cxxopt=-funsafe-math-optimizations --cxxopt=-ftree-vectorize --copt=-DACC_PROFILE --define tflite_with_xnnpack=false --copt=-DTFLITE_ENABLE_XNNPACK=OFF --copt=-DTFLITE_WITHOUT_XNNPACK --copt=-DACC_NEON --@secda_tools//:config=fpga"
+          FLAGS="--copt=-DSECDA_LOGGING_DISABLED --cxxopt=-march=armv7-a --cxxopt=-mfpu=neon --cxxopt=-funsafe-math-optimizations --cxxopt=-ftree-vectorize --copt=-DACC_PROFILE --define tflite_with_xnnpack=false --copt=-DTFLITE_ENABLE_XNNPACK=OFF --copt=-DTFLITE_WITHOUT_XNNPACK --copt=-DACC_NEON --@secda_tools//:config=fpga --override_module=secda_tools=$GITHUB_WORKSPACE/secda_tools_yamali"
           T=//tensorflow/lite/delegates/utils/secda_delegates/vit_delegate/v9
           set -o pipefail
           bazel6 --output_user_root=$BAZEL_ROOT build --config=elinux_armhf -c opt --jobs=4 \
@@ -132,7 +199,7 @@ jobs:
       - name: 9 - Sonucu yukle (karta atilacak dosyalar)
         uses: actions/upload-artifact@v4
         with:
-          name: flexvit-pynq-z2-v2
+          name: flexvit-pynq-z2-v3
           path: cikti
 
       - name: 10 - Gunlugu yukle (hata olsa da)
