@@ -4,7 +4,7 @@
 #   flexvit-pynq-z2      -> karta atilacak dosyalar
 #   derleme-gunlugu      -> hata olursa bana gonderilecek kayit
 
-name: FlexViT derleme (bariyer)
+name: FlexViT derleme (teshis)
 
 on:
   workflow_dispatch:
@@ -94,13 +94,14 @@ jobs:
           for f in $FILES; do python3 yama_dma_adres.py "$f"; done
           grep -n "fv_dma_addr\|DMA_IN_BUF_SIZE_4" $FILES
 
-      - name: 5c - secda_tools DMA API'sine bellek bariyeri ekle
+      - name: 5c - secda_tools DMA API'sine bariyer + gecikme secenegi ekle
         run: |
           git clone -q --depth 1 --branch 0.2.2 https://github.com/judeharis/secda_tools.git secda_tools_yamali
           cat > yama_bariyer.py <<'PYEOF'
           # FlexViT/SECDA DMA API'sine bellek bariyeri ekler (axi_api_v4.tpp).
           # DMA baslatilmadan once: dsb + L2 (PL310) cache sync + dsb   -> islemcinin yazdiklari DDR'ye ulasmis olur
           # DMA bittikten sonra: dsb                                      -> cikti okumalari DMA'dan sonra yapilir
+          # FLEXVIT_DELAY_US=N her DMA baslatmadan once N mikrosaniye bekler (zamanlama testi).
           # FLEXVIT_NO_L2SYNC=1 ortam degiskeni L2 sync'i kapatir (yalniz dsb kalir) -> karsilastirma icin.
           import sys
           p = sys.argv[1]
@@ -143,11 +144,16 @@ jobs:
           #endif
           }
           static inline void fv_barrier() { fv_dsb(); fv_l2_sync(); fv_dsb(); }
+          static int fv_delay_us = -1;
+          static inline void fv_delay() {
+            if (fv_delay_us < 0) { const char *e = getenv("FLEXVIT_DELAY_US"); fv_delay_us = e ? atoi(e) : 0; }
+            if (fv_delay_us > 0) usleep(fv_delay_us);
+          }
           // ---- yama sonu ----
           '''
           n = 0
           old_w = "void *base_addr = (void *)dma_addr;\n  *((volatile unsigned int *)"
-          new_w = "void *base_addr = (void *)dma_addr;\n  if (offset == MM2S_LENGTH || offset == S2MM_LENGTH) fv_barrier();\n  *((volatile unsigned int *)"
+          new_w = "void *base_addr = (void *)dma_addr;\n  if (offset == MM2S_LENGTH || offset == S2MM_LENGTH) { fv_barrier(); fv_delay(); }\n  *((volatile unsigned int *)"
           assert s.count(old_w) == 1, "writeMappedReg bulunamadi"
           s = s.replace(old_w, new_w); n += 1
           for st in ("mm2s_status", "s2mm_status"):
@@ -199,7 +205,7 @@ jobs:
       - name: 9 - Sonucu yukle (karta atilacak dosyalar)
         uses: actions/upload-artifact@v4
         with:
-          name: flexvit-pynq-z2-v3
+          name: flexvit-pynq-z2-v4
           path: cikti
 
       - name: 10 - Gunlugu yukle (hata olsa da)
